@@ -24,6 +24,12 @@ cargo run --release # To run in release mode
 cargo run           # To run in debug mode
 ```
 
+## BMP388 note
+The board schematic already includes an Adafruit BMP388 sensor. The current firmware logs the intended SPI pin mapping from [pocketQube_connections.txt](pocketQube_connections.txt):
+- SCK is on PB6 (NET_3)
+- SDI is on PB7 (NET_19)
+- The exported schematic leaves the SDO and CS lines unconnected to the STM32, so full sensor readout will require a hardware-side wiring update or a revised board export.
+
 Tests in `test/` directory can be run with:
 ```
 cargo test --release
