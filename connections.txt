@@ -1,0 +1,27 @@
+PA0  -> Header H2
+PA1  -> Header H2
+PA2  -> Header H1
+PA3  -> Header H1
+
+PA4  -> LoRa CS
+PA5  -> LoRa SCK
+PA6  -> LoRa MISO
+PA7  -> LoRa MOSI
+
+PA9  -> GPS TX
+PA10 -> GPS RX
+
+PB0  -> LoRa BUSY
+PB1  -> LoRa RESET
+PB2  -> LoRa DIO
+PB3  -> Buzzer
+
+PB6  -> BMP388 I2C SCL
+PB7  -> BMP388 I2C SDA
+PB6  -> BNO055 I2C SCL
+PB7  -> BNO055 I2C SDA
+
+PB12 -> ESP32 CS/control
+PB13 -> ESP32 SCK
+PB14 -> ESP32 MISO
+PB15 -> ESP32 MOSI
