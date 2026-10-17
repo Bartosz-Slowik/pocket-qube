@@ -1,0 +1,3 @@
+# Override the parent folder's embedded target so this builds for the host PC
+[build]
+target = "host-tuple"

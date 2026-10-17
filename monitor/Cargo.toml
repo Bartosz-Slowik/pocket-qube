@@ -1,0 +1,12 @@
+[package]
+name = "monitor"
+version = "0.1.0"
+edition = "2024"
+default-run = "monitor"
+
+[dependencies]
+eframe = "0.37.0"
+serialport = "4.7"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+jpeg-encoder = "0.7"
+walkers = "0.63"
