@@ -8,6 +8,12 @@ Otherwise you need to install:
 - a relatively recent version of Rust
 - probe-rs: e.g. through `cargo binstall probe-rs-tools`
 
+## Local generated files
+Git ignores Rust build output, local environment secrets, and the monitor's
+captured photos (`monitor/images/`), logs (`monitor/logs/`), and map tile cache
+(`monitor/tiles/`). Sample images in `assets/` and Cargo lockfiles remain tracked.
+Ignore rules do not remove files that are already tracked by Git.
+
 ## Linux udev rules
 To make flashing STM not require root permissions you can add the following rules to udev. They allow reading and writing to STLINK devices for all users.
 ```
@@ -36,7 +42,6 @@ cargo test --release
 cargo test
 ```
 Similarly to `cargo run`, this will compile, flash and execute test code. Between each test the microcontroller is restarted.
-
 
 
 

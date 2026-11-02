@@ -1,0 +1,14 @@
+# XIAO ESP32S3 Sense: 8 MB flash, 8 MB octal PSRAM (camera frames live there)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+# The JPEG encoder keeps ~14 KB of tables on the stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+CONFIG_FREERTOS_HZ=1000
+# Lets the CPU drop to 80 MHz between photos
+CONFIG_PM_ENABLE=y
+# Wi-Fi and Bluetooth are never started, so their radio stays off; this keeps unused parts out
+CONFIG_BT_ENABLED=n
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n

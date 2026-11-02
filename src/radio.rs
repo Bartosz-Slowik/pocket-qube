@@ -1,167 +1,149 @@
-use embassy_stm32::{
-    gpio::{Input, Output},
-    spi::Spi,
-};
-use embassy_time::{Duration, Timer};
-use lr2021::{
-    lora::{HeaderType, Ldro, LoraBw, LoraCr, LoraModulationParams, LoraPacketParams, Sf},
-    radio::{FallbackMode, PaLfMode, PacketType, RampTime, RxBoost, RxPath},
-    system::{ChipMode, LfClock, TcxoVoltage},
-    BusyBlocking, Lr2021, Lr2021Error,
-};
+//! Telemetry goes out on robust LoRa, images on the most robust FLRC setting.
+//! Every setting here must match the receiver's `receiver/src/main.rs`.
+use embassy_stm32::gpio::{Input, Output};
+use embassy_stm32::mode::Async;
+use embassy_stm32::spi::{Spi, mode::Master};
+use embassy_time::{Duration, Instant, Timer};
+use lr2021::flrc::{AgcPblLen, Crc, FlrcBitrate, FlrcCr, FlrcPacketParams, PktFormat, SwLen, SwMatch, SwTx};
+use lr2021::lora::{HeaderType, Ldro, LoraBw, LoraCr, LoraModulationParams, LoraPacketParams, Sf};
+use lr2021::radio::{FallbackMode, PaLfMode, PacketType, RampTime, RxBoost, RxPath};
+use lr2021::system::{ChipMode, LfClock, TcxoVoltage};
+use lr2021::{BusyBlocking, Lr2021, Lr2021Error, PulseShape};
 
-use crate::telemetry::{self, PACKET_LEN};
+pub const MAX_LEN: usize = 255;
+const LORA_HZ: u32 = 869_700_000;
+const FLRC_HZ: u32 = 869_500_000;
+const FLRC_SYNC: u32 = 0x5A3C_9E71;
+/// Listen before talk: only a strong, nearby signal counts as the channel being in use
+const LBT_THRESHOLD_DBM: i16 = -60;
+/// Busy checks in a row before sending anyway, so a noisy channel can't silence the satellite
+const LBT_TRIES: u32 = 3;
+/// The longest `channel_clear` can take
+pub const LBT_MAX: Duration = Duration::from_millis(40);
 
-const FREQUENCY_HZ: u32 = 850_000_000;
-const TX_AIRTIME_WAIT: Duration = Duration::from_millis(300);
+pub type Radio = Lr2021<Output<'static>, Spi<'static, Async, Master>, BusyBlocking<Input<'static>>>;
 
-pub struct SpiWrapper(
-    Spi<
-        'static,
-        embassy_stm32::mode::Blocking,
-        embassy_stm32::spi::mode::Master,
-    >,
-);
+/// Radio error plus the step that failed.
+pub type Error = (&'static str, Lr2021Error);
 
-impl SpiWrapper {
-    pub fn new(
-        spi: Spi<
-            'static,
-            embassy_stm32::mode::Blocking,
-            embassy_stm32::spi::mode::Master,
-        >,
-    ) -> Self {
-        Self(spi)
+trait At<T> {
+    fn at(self, step: &'static str) -> Result<T, Error>;
+}
+
+impl<T> At<T> for Result<T, Lr2021Error> {
+    fn at(self, step: &'static str) -> Result<T, Error> {
+        self.map_err(|e| (step, e))
     }
 }
 
-impl embedded_hal::spi::ErrorType for SpiWrapper {
-    type Error = embassy_stm32::spi::Error;
+pub async fn setup(r: &mut Radio) -> Result<(), Error> {
+    // lr2021 leaves NSS (PA4) low after a failed command, which breaks every later command
+    embassy_stm32::pac::GPIOA.bsrr().write(|w| w.set_bs(4, true));
+    r.reset().await.at("reset")?;
+    r.wait_ready(Duration::from_millis(500)).await.at("boot")?;
+    r.set_chip_mode(ChipMode::StandbyRc).await.at("standby")?;
+    r.set_regulator_mode(true).await.at("regulator")?;
+    r.set_tcxo(TcxoVoltage::Tcxo2v2, 64_000).await.at("tcxo")?;
+    r.set_lf_clk(LfClock::Rc).await.at("lf_clock")?;
+    r.calibrate(true, true, true, true, true, true).await.at("calibrate")?;
+    Timer::after_millis(20).await;
+
+    r.set_rf(LORA_HZ).await.at("frequency")?;
+    r.set_rx_path(RxPath::LfPath, RxBoost::Off).await.at("rx_path")?;
+    r.patch_simo(None).await.at("patch_simo")?;
+    r.set_pa_lf(PaLfMode::LfPaFsm, 7, 7).await.at("pa")?;
+    r.set_tx_params(44, RampTime::Ramp208u).await.at("tx_params")?;
+    // Keeps the TCXO running between packets instead of restarting it for every TX and LBT
+    r.set_fallback(FallbackMode::StandbyXosc).await.at("fallback")?;
+    lora_mode(r).await
 }
 
-impl<W: embassy_stm32::spi::Word> embedded_hal_async::spi::SpiBus<W> for SpiWrapper {
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn write(&mut self, words: &[W]) -> Result<(), Self::Error> {
-        self.0.blocking_write(words)
-    }
-
-    async fn read(&mut self, words: &mut [W]) -> Result<(), Self::Error> {
-        self.0.blocking_read(words)
-    }
-
-    async fn transfer(&mut self, read: &mut [W], write: &[W]) -> Result<(), Self::Error> {
-        self.0.blocking_transfer(read, write)
-    }
-
-    async fn transfer_in_place(&mut self, words: &mut [W]) -> Result<(), Self::Error> {
-        self.0.blocking_transfer_in_place(words)
-    }
+/// Telemetry: LoRa SF12/BW250/CR4-5 with LDRO, sync word 0x34, 8 preamble, explicit header, CRC on.
+pub async fn lora_mode(r: &mut Radio) -> Result<(), Error> {
+    // Mode changes are rejected right after TX or in StandbyXosc, like on the receiver
+    r.set_chip_mode(ChipMode::StandbyRc).await.at("lora_standby")?;
+    r.set_rf(LORA_HZ).await.at("lora_frequency")?;
+    r.set_packet_type(PacketType::Lora).await.at("lora_type")?;
+    // Semtech's drivers (and so the LoRa-E5) enable LDRO for SF12/BW250, so both ends must too
+    r.set_lora_modulation(&LoraModulationParams::new(Sf::Sf12, LoraBw::Bw250, LoraCr::Cr1Ham45Si, Ldro::On))
+        .await
+        .at("lora_modulation")?;
+    r.set_lora_syncword(0x34).await.at("lora_syncword")
 }
 
-pub type Radio = Lr2021<Output<'static>, SpiWrapper, BusyBlocking<Input<'static>>>;
-
-async fn check_status(radio: &mut Radio) -> Result<(), Lr2021Error> {
-    radio.get_status().await.map(|_| ())
+/// Images: FLRC 260 kb/s, CR 1/2, BT 0.5, 32-bit preamble and sync word, CRC-32.
+pub async fn flrc_mode(r: &mut Radio) -> Result<(), Error> {
+    r.set_chip_mode(ChipMode::StandbyRc).await.at("flrc_standby")?;
+    r.set_rf(FLRC_HZ).await.at("flrc_frequency")?;
+    r.set_packet_type(PacketType::Flrc).await.at("flrc_type")?;
+    r.set_flrc_modulation(FlrcBitrate::Br0260, FlrcCr::Cr12, PulseShape::Bt0p5)
+        .await
+        .at("flrc_modulation")?;
+    r.set_flrc_syncword(1, FLRC_SYNC, false).await.at("flrc_syncword")
 }
 
-pub async fn configure(mut radio: Radio) -> Result<Radio, Lr2021Error> {
-    radio.reset().await?;
-    radio.set_chip_mode(ChipMode::StandbyRc).await?;
-    check_status(&mut radio).await?;
-    radio.set_regulator_mode(true).await?; // DCDC mode
-    check_status(&mut radio).await?;
-    radio.set_tcxo(TcxoVoltage::Tcxo2v2, 64_000).await?; // 2.2V TCXO
-    check_status(&mut radio).await?;
-    radio.set_lf_clk(LfClock::Rc).await?; // RC LF clock
-    check_status(&mut radio).await?;
-    radio.calibrate(true, true, true, true, true, true).await?;
-    Timer::after(Duration::from_millis(20)).await;
-    check_status(&mut radio).await?;
-    radio.get_version().await?;
+/// Listen before talk on the current frequency and modulation. Returns false if the channel
+/// stayed busy for `LBT_TRIES` checks and the packet should go out anyway.
+pub async fn channel_clear(r: &mut Radio) -> Result<bool, Error> {
+    for _ in 0..LBT_TRIES {
+        r.set_rx(0xFF_FFFF, true).await.at("lbt_rx")?;
+        // Lets the receiver's gain settle before measuring
+        Timer::after_micros(300).await;
+        let dbm = -(r.get_rssi_avg(4).await.at("lbt_rssi")? as i16) / 2;
+        r.set_chip_mode(ChipMode::StandbyXosc).await.at("lbt_standby")?;
+        if dbm < LBT_THRESHOLD_DBM {
+            return Ok(true);
+        }
+        // 2-10 ms, varied so two waiting transmitters don't retry in step
+        Timer::after_millis(2 + Instant::now().as_ticks() % 9).await;
+    }
+    Ok(false)
+}
 
-    // Match exact Ebyte receiver default PHY configuration:
-    // Frequency: 850.000 MHz
-    // Modulation: LoRa (SF8, BW 125kHz, CR 4/5, No LDRO/PPM)
-    // Packet: 8 Preamble symbols, 14-byte Payload, Explicit Header, CRC Enabled, Normal IQ
-    // Sync Word: 0x34
-    let modulation = LoraModulationParams::new(
-        Sf::Sf8,
-        LoraBw::Bw125,
-        LoraCr::Cr1Ham45Si, // 4/5
-        Ldro::Off,          // No PPM / LDRO
+/// Starts a LoRa packet; it's on air for `lora_airtime(data.len())`.
+pub async fn send_lora(r: &mut Radio, data: &[u8]) -> Result<(), Error> {
+    r.set_lora_packet(&LoraPacketParams::new(8, data.len() as u8, HeaderType::Explicit, true, false))
+        .await
+        .at("lora_packet")?;
+    transmit(r, data).await
+}
+
+/// Starts an FLRC packet; it's on air for `flrc_airtime(data.len())`.
+pub async fn send_flrc(r: &mut Radio, data: &[u8]) -> Result<(), Error> {
+    let params = FlrcPacketParams::new(
+        AgcPblLen::Len32Bits,
+        SwLen::Sw32b,
+        SwTx::Sw1,
+        SwMatch::Match1,
+        PktFormat::Dynamic,
+        Crc::Crc32,
+        data.len() as u16,
     );
-    let packet_params = LoraPacketParams::new(
-        8,                   // 8 preamble symbols
-        PACKET_LEN as u8,    // 14 bytes payload
-        HeaderType::Explicit,// Explicit header
-        true,                // CRC enabled
-        false,               // IQ inversion disabled (normal IQ)
-    );
-
-    radio.set_packet_type(PacketType::Lora).await?;
-    check_status(&mut radio).await?;
-    radio.set_lora_packet(&packet_params).await?;
-    check_status(&mut radio).await?;
-    radio.set_lora_syncword(0x34).await?;
-    check_status(&mut radio).await?;
-    radio.set_lora_modulation(&modulation).await?;
-    check_status(&mut radio).await?;
-    radio.set_rf(FREQUENCY_HZ).await?;
-    check_status(&mut radio).await?;
-    radio.set_rx_path(RxPath::LfPath, RxBoost::Off).await?;
-    check_status(&mut radio).await?;
-    radio.patch_simo(None).await?;
-    radio.set_pa_lf(PaLfMode::LfPaFsm, 7, 6).await?;
-    check_status(&mut radio).await?;
-    radio.set_tx_params(0, RampTime::Ramp208u).await?;
-    check_status(&mut radio).await?;
-    radio.set_fallback(FallbackMode::StandbyRc).await?;
-    check_status(&mut radio).await?;
-
-    defmt::info!("LR2021 ready: 850 MHz, SF8, BW125, CR4/5, Sync 0x34, Preamble 8, Explicit, CRC ON");
-    Ok(radio)
+    r.set_flrc_packet(&params).await.at("flrc_packet")?;
+    transmit(r, data).await
 }
 
-#[embassy_executor::task]
-pub async fn radio_task(mut radio: Radio) {
-    let mut sequence = 0u8;
+async fn transmit(r: &mut Radio, data: &[u8]) -> Result<(), Error> {
+    r.get_and_clear_irq().await.at("clear_irq")?;
+    r.wr_tx_fifo_from(data).await.at("write_fifo")?;
+    r.set_tx(0).await.at("set_tx")
+}
 
-    loop {
-        let telemetry = telemetry::LATEST.wait().await;
-        let mut packet = [0u8; PACKET_LEN];
-        telemetry::encode(&mut packet, sequence, telemetry);
-        radio.buffer_mut()[..PACKET_LEN].copy_from_slice(&packet);
+/// Whether the packet started by `send_lora`/`send_flrc` has finished.
+pub async fn sent(r: &mut Radio) -> Result<bool, Error> {
+    Ok(r.get_status().await.at("tx_status")?.1.tx_done())
+}
 
-        if let Err(error) = radio.get_and_clear_irq().await {
-            defmt::error!("IRQ clear before TX failed: {}", error);
-            continue;
-        }
+/// LoRa SF12/BW250/CR4-5/LDRO time on air, plus a 10 ms margin.
+pub fn lora_airtime(len: usize) -> Duration {
+    // Semtech formula: 20.25 symbols of preamble+header, then 5 symbols per 40 payload bits
+    let blocks = (8 * len as u64 - 4).div_ceil(40);
+    Duration::from_micros(331_776 + blocks * 5 * 16_384 + 10_000)
+}
 
-        if let Err(error) = radio.wr_tx_fifo(PACKET_LEN).await {
-            defmt::error!("FIFO write failed: {}", error);
-            continue;
-        }
-
-        if let Err(error) = check_status(&mut radio).await {
-            defmt::error!("FIFO status failed: {}", error);
-            continue;
-        }
-
-        if let Err(error) = radio.set_tx(0).await {
-            defmt::error!("TX start failed: {}", error);
-            continue;
-        }
-
-        Timer::after(TX_AIRTIME_WAIT).await;
-
-        match radio.get_and_clear_irq().await {
-            Ok(_) => defmt::debug!("TX #{:03} | {}", sequence, telemetry),
-            Err(error) => defmt::error!("TX #{:03} failed: {}", sequence, error),
-        }
-
-        sequence = sequence.wrapping_add(1);
-    }
+/// FLRC 260 kb/s CR 1/2 time on air (preamble + sync uncoded, rest coded), plus a 2 ms margin.
+/// Only an upper bound: `sent` tells when a packet really finished.
+pub fn flrc_airtime(len: usize) -> Duration {
+    let bits = 64 + 2 * (16 + 8 * len as u64 + 32);
+    Duration::from_micros(bits * 1_000_000 / 260_000 + 2_000)
 }
