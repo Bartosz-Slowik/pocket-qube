@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PocketQube</title>
+<link rel="stylesheet" href="leaflet.css">
+<script src="leaflet.js"></script>
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #15171c; color: #ddd; }
+  header { padding: 8px 14px; background: #20232b; display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  #conn { font-size: 13px; color: #8a8; }
+  main { display: grid; gap: 12px; padding: 12px; grid-template-columns: minmax(0, 1fr); }
+  section { background: #1d2027; border-radius: 6px; padding: 10px; }
+  h2 { font-size: 15px; margin: 0 0 8px; color: #9ab; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  td { padding: 3px 4px; border-bottom: 1px solid #2a2e37; }
+  td:first-child { color: #889; }
+  #map { height: 320px; border-radius: 4px; }
+  #mapbox.big { position: fixed; inset: 12px; z-index: 1000; display: flex; flex-direction: column; }
+  #mapbox.big #map { flex: 1; }
+  #model { width: 100%; max-width: 300px; height: 320px; display: block; margin: 0 auto; }
+  canvas { width: 100%; height: 150px; background: #191b20; border-radius: 4px; }
+  #livebox { display: flex; flex-direction: column; }
+  #progress { height: 6px; background: #2a2e37; border-radius: 3px; margin: 4px 0 8px; overflow: hidden; }
+  /* Polls come every second, so a 1 s glide makes the bar move continuously */
+  #progress div { height: 100%; width: 0; background: #4682dc; transition: width 1s linear; }
+  /* Absolute so the image fills the space next to the graphs instead of stretching the rows */
+  #livewrap { position: relative; flex: 1; aspect-ratio: 4 / 3; }
+  #live { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; border-radius: 4px; image-rendering: pixelated; }
+  #gallery { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  #gallery a { color: #bbb; text-decoration: none; font-size: 12px; }
+  #gallery img { width: 100%; border-radius: 4px; display: block; }
+  pre { font-size: 12px; max-height: 240px; overflow: auto; margin: 0; white-space: pre-wrap; }
+  .wide { grid-column: 1 / -1; }
+  label { font-size: 13px; }
+  @media (min-width: 1001px) {
+    main {
+      grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 2fr);
+      grid-template-areas: "tele model map live" "alt temp signal live";
+    }
+    #telebox { grid-area: tele; } #mapbox { grid-area: map; } #livebox { grid-area: live; }
+    #modelbox { grid-area: model; } #altbox { grid-area: alt; } #tempbox { grid-area: temp; }
+    #signalbox { grid-area: signal; }
+    #livewrap { aspect-ratio: auto; }
+    #mapbox { display: flex; flex-direction: column; }
+    #map { flex: 1; }
+  }
+</style>
+</head>
+<body>
+<header><h1>PocketQube ground station</h1><span id="conn">connecting…</span></header>
+<main>
+  <section id="telebox"><h2>Telemetry</h2><table id="tele"></table></section>
+  <section id="mapbox"><h2>Map <label><input type="checkbox" id="follow" checked> follow</label> <label><input type="checkbox" id="bigmap"> big</label></h2><div id="map"></div></section>
+  <section id="livebox"><h2>Live image <small id="photorate" style="color:#888;font-weight:normal"></small></h2><div id="istatus"></div><div id="progress"><div></div></div><div id="livewrap"><img id="live" alt=""></div></section>
+  <section id="modelbox"><h2>Orientation (IMU) <small style="color:#888;font-weight:normal">N = magnetic north</small></h2><canvas id="model"></canvas></section>
+  <section id="altbox"><h2>Altitude (m)</h2><canvas id="alt"></canvas><h2>Ascent rate (m/s)</h2><canvas id="rate"></canvas></section>
+  <section id="tempbox"><h2>Temperature (°C)</h2><canvas id="temp"></canvas><h2>GPS</h2><canvas id="gps"></canvas></section>
+  <section id="signalbox"><h2>Signal (dBm, SNR dB)</h2><canvas id="signal"></canvas><h2>Link quality (%)</h2><canvas id="quality"></canvas></section>
+  <section class="wide"><h2>Photos from this run</h2><div id="gallery">No photos yet</div></section>
+  <section class="wide"><h2>Log</h2><pre id="log"></pre></section>
+</main>
+<script>
+const rows = [], photos = [];
+let t = 0, p = 0, imageVersion = -1, flight = null;
+
+const map = L.map('map').setView([50.06, 19.94], 9);
+new ResizeObserver(() => map.invalidateSize()).observe(document.getElementById('map'));
+const bigMap = document.getElementById('bigmap');
+bigMap.onchange = () => document.getElementById('mapbox').classList.toggle('big', bigMap.checked);
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && bigMap.checked) { bigMap.checked = false; bigMap.onchange(); } });
+L.tileLayer('tiles/{z}/{x}/{y}.png', { maxZoom: 17, attribution: '© OpenStreetMap contributors' }).addTo(map);
+const track = L.polyline([], { color: '#e33', weight: 3 }).addTo(map);
+const here = L.circleMarker([0, 0], { radius: 7, color: '#fff', fillColor: '#e33', fillOpacity: 1 });
+
+const fmt = (v, digits, unit) => v === null || v === undefined ? '–' : v.toFixed(digits) + unit;
+const fixName = { '1': 'fix', '0': 'no fix', 'X': 'no data from GPS' };
+
+function showTelemetry(r) {
+  document.getElementById('tele').innerHTML = [
+    ['Packet', '#' + r.seq + ' at ' + new Date(r.time * 1000).toLocaleTimeString()],
+    ['Heading / roll / pitch', `${fmt(r.heading, 1, '°')} / ${fmt(r.roll, 1, '°')} / ${fmt(r.pitch, 1, '°')}`],
+    ['GPS altitude', fmt(r.alt, 0, ' m')],
+    ['Barometric altitude', fmt(r.baro_alt, 0, ' m')],
+    ['Pressure', fmt(r.pressure, 0, ' Pa')],
+    ['Temperature', fmt(r.temp, 1, ' °C')],
+    ['Position', r.lat === null ? '–' : `${r.lat.toFixed(5)}, ${r.lon.toFixed(5)}`],
+    ['GPS', `${r.sats} sats, ${fixName[r.fix] ?? '?'}, best ${fmt(r.cn0, 0, ' dBHz')}`],
+    ['Signal', r.radio],
+  ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+}
+
+// `zones`: [low, high, colour] bands shaded behind the lines
+function graph(id, series, zones = []) {
+  const c = document.getElementById(id), g = c.getContext('2d');
+  c.width = c.clientWidth * devicePixelRatio; c.height = c.clientHeight * devicePixelRatio;
+  g.scale(devicePixelRatio, devicePixelRatio);
+  const w = c.clientWidth, h = c.clientHeight;
+  const pts = series.flatMap(s => s.points);
+  if (!pts.length) { g.fillStyle = '#777'; g.fillText('No data yet', w / 2 - 30, h / 2); return; }
+  let x0 = Math.min(...pts.map(q => q[0])), x1 = Math.max(...pts.map(q => q[0]), x0 + 1);
+  let y0 = Math.min(...pts.map(q => q[1])), y1 = Math.max(...pts.map(q => q[1]));
+  const pad = Math.max((y1 - y0) * 0.1, 1); y0 -= pad; y1 += pad;
+  const X = x => 8 + (x - x0) / (x1 - x0) * (w - 16), Y = y => h - 16 - (y - y0) / (y1 - y0) * (h - 32);
+  for (const [lo, hi, color] of zones) {
+    const a = Math.max(lo, y0), b = Math.min(hi, y1);
+    if (a < b) { g.fillStyle = color; g.fillRect(0, Y(b), w, Y(a) - Y(b)); }
+  }
+  g.font = '11px monospace'; g.fillStyle = '#888';
+  g.fillText(y1.toFixed(0), 8, 12); g.fillText(y0.toFixed(0), 8, h - 4);
+  series.forEach((s, i) => {
+    g.strokeStyle = s.color; g.lineWidth = 1.5; g.beginPath();
+    s.points.forEach((q, j) => j ? g.lineTo(X(q[0]), Y(q[1])) : g.moveTo(X(q[0]), Y(q[1])));
+    g.stroke();
+    const last = s.points.at(-1);
+    g.fillStyle = s.color; g.textAlign = 'right';
+    g.fillText(`${s.name}: ${last ? last[1].toFixed(1) : '–'}`, w - 6, 14 + 14 * i);
+    g.textAlign = 'left';
+  });
+}
+
+function points(key) { return rows.filter(r => r[key] != null).map(r => [r.time, r[key]]); }
+
+// RSSI bands for FLRC images (260 kb/s needs roughly -105 dBm); LoRa SF12 copes far below
+const SIGNAL_ZONES = [[-85, Infinity, 'rgba(80, 200, 120, 0.12)'], [-100, -85, 'rgba(230, 180, 30, 0.14)'],
+                      [-Infinity, -100, 'rgba(220, 70, 70, 0.16)']];
+
+// Telemetry packets received out of the last 20 sent, from the satellite's sequence numbers
+function loraReceived() {
+  return rows.filter(r => r.lora_lost != null).map((r, i, all) => {
+    const recent = all.slice(Math.max(0, i - 19), i + 1);
+    const lost = recent.reduce((s, x) => s + x.lora_lost, 0);
+    return [r.time, 100 * recent.length / (recent.length + lost)];
+  });
+}
+
+// Share of each cycle's image blocks that arrived
+function imageReceived() {
+  return rows.filter(r => r.blocks_got + r.blocks_lost > 0)
+             .map(r => [r.time, 100 * r.blocks_got / (r.blocks_got + r.blocks_lost)]);
+}
+
+// Vertical speed from barometric altitude over ~15 s, which smooths the sensor noise
+function ascentRate() {
+  const alt = points('baro_alt');
+  return alt.slice(5).map((q, i) => [q[0], (q[1] - alt[i][1]) / (q[0] - alt[i][0])]).filter(q => isFinite(q[1]));
+}
+
+// Share of the current photo's blocks that arrived; jumps back to 0 without gliding for a new photo
+let progressImage = null;
+function showProgress(status) {
+  const m = status.match(/Image (\d+):.*blocks (\d+)\/(\d+)/);
+  if (!m) return;
+  const bar = document.querySelector('#progress div');
+  if (m[1] !== progressImage) {
+    progressImage = m[1];
+    bar.style.transition = 'none';
+    bar.style.width = '0';
+    bar.offsetWidth; // applies the reset before the transition comes back
+    bar.style.transition = '';
+  }
+  const done = Number(m[3]) ? m[2] / m[3] : 0;
+  bar.style.width = 100 * done + '%';
+  bar.style.background = done >= 1 ? '#50c878' : '';
+}
+
+function showPhotoRate() {
+  if (photos.length < 2) return;
+  const [a, b] = photos.slice(-2);
+  document.getElementById('photorate').textContent =
+    `every ${b.time - a.time} s, last ${b.complete ?? (b.partial ? '<100' : 100)}% complete`;
+}
+
+// Normal and corner indices (bit 0 = x, bit 1 = y, bit 2 = z) per box face
+const FACES = [[[0, 0, 1], [4, 5, 7, 6]], [[0, 0, -1], [0, 2, 3, 1]], [[1, 0, 0], [1, 3, 7, 5]],
+               [[-1, 0, 0], [0, 4, 6, 2]], [[0, 1, 0], [2, 6, 7, 3]], [[0, -1, 0], [0, 1, 5, 4]]];
+// (min corner, max corner, colour per face in FACES order); the orange face is the front
+const PLATE = [170, 170, 180];
+const BOXES = [[[-1, -1, -1], [1, 1, 1], [[230, 120, 30], [120, 120, 120], [60, 160, 90], [60, 160, 90], [70, 130, 220], [50, 50, 70]]],
+               [[-1.8, -1.2, -1], [1.8, -1, 1], [PLATE, PLATE, PLATE, PLATE, PLATE, PLATE]]];
+// Tether tie-off point, pinned near the top; everything turns around it
+const PIVOT = [0, 2.6, 0];
+// Camera lens: a cylinder standing on the top back-right corner, looking up (+y)
+const LENS = { x: 0.6, z: -0.6, r: 0.3, y0: 1, y1: 1.6 };
+
+/// The payload hanging on its line, rotated by heading/roll/pitch in degrees.
+function drawModel(r) {
+  const c = document.getElementById('model'), g = c.getContext('2d');
+  c.width = c.clientWidth * devicePixelRatio; c.height = c.clientHeight * devicePixelRatio;
+  g.scale(devicePixelRatio, devicePixelRatio);
+  const w = c.clientWidth;
+  const rad = d => d * Math.PI / 180;
+  // Without IMU data the model just hangs straight
+  const att = r && r.heading !== null && r.roll !== null && r.pitch !== null ? r : null;
+  // The BNO055 sits upside down in the satellite, so flip about the forward axis first
+  const h = att ? -rad(att.heading) : 0, ro = att ? rad(att.roll) + Math.PI : 0, p = att ? rad(att.pitch) : 0;
+  const tilt = 20 * Math.PI / 180;
+  // Roll about the forward axis, pitch about the side axis, heading about vertical, then a
+  // fixed camera tilt so the top is visible
+  const rotate = ([x, y, z]) => {
+    [x, y] = [x * Math.cos(ro) - y * Math.sin(ro), x * Math.sin(ro) + y * Math.cos(ro)];
+    [y, z] = [y * Math.cos(p) - z * Math.sin(p), y * Math.sin(p) + z * Math.cos(p)];
+    [x, z] = [x * Math.cos(h) + z * Math.sin(h), -x * Math.sin(h) + z * Math.cos(h)];
+    [y, z] = [y * Math.cos(tilt) - z * Math.sin(tilt), y * Math.sin(tilt) + z * Math.cos(tilt)];
+    return [x, y, z];
+  };
+  const place = ([x, y, z]) => rotate([x - PIVOT[0], y - PIVOT[1], z - PIVOT[2]]);
+  const project = ([x, y, z]) => { const s = 40 * 12 / (12 - z); return [w / 2 + x * s, 40 - y * s]; };
+
+  // Compass on the ground below, fixed to the world: heading 0 faces north (+z), 90 east (-x)
+  const view = ([x, y, z]) => [x, y * Math.cos(tilt) - z * Math.sin(tilt), y * Math.sin(tilt) + z * Math.cos(tilt)];
+  const ground = (bearing, r) => project(view([-r * Math.sin(bearing), -1.9 - PIVOT[1], r * Math.cos(bearing)]));
+  g.strokeStyle = '#555'; g.lineWidth = 1; g.beginPath();
+  for (let i = 0; i <= 48; i++) { const [x, y] = ground(i / 48 * 2 * Math.PI, 2.3); i ? g.lineTo(x, y) : g.moveTo(x, y); }
+  g.stroke();
+  g.strokeStyle = '#e33'; g.lineWidth = 2; g.beginPath(); g.moveTo(...ground(0, 0)); g.lineTo(...ground(0, 2.3)); g.stroke();
+  g.font = 'bold 13px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (const [label, deg] of [['N', 0], ['E', 90], ['S', 180], ['W', 270]]) {
+    g.fillStyle = label === 'N' ? '#e33' : '#999';
+    g.fillText(label, ...ground(rad(deg), 2.8));
+  }
+  g.textAlign = 'left'; g.textBaseline = 'alphabetic';
+
+  // [depth, draw], drawn far to near
+  const shapes = [];
+  // A flat face in model coordinates, shaded by how much it faces the viewer
+  const face = (normal, points, color, outline = true, bias = 0) => {
+    const n = rotate(normal);
+    if (n[2] <= 0) return; // facing away
+    const k = 0.35 + 0.65 * n[2];
+    const placed = points.map(place);
+    const depth = placed.reduce((s, q) => s + q[2], 0) / placed.length + bias;
+    shapes.push([depth, () => {
+      g.fillStyle = `rgb(${color.map(v => v * k).join(',')})`;
+      g.strokeStyle = outline ? '#000' : g.fillStyle; g.lineWidth = 1;
+      g.beginPath(); placed.map(project).forEach(([x, y], j) => j ? g.lineTo(x, y) : g.moveTo(x, y));
+      g.closePath(); g.fill(); g.stroke();
+    }]);
+  };
+  for (const [min, max, colors] of BOXES) {
+    const corner = i => [0, 1, 2].map(a => (i >> a) & 1 ? max[a] : min[a]);
+    FACES.forEach(([normal, corners], f) => face(normal, corners.map(corner), colors[f]));
+  }
+  // The bias keeps the lens drawn over the top face it sits on
+  const ring = y => Array.from({ length: 16 }, (_, i) => {
+    const a = i / 16 * 2 * Math.PI;
+    return [LENS.x + LENS.r * Math.cos(a), y, LENS.z + LENS.r * Math.sin(a)];
+  });
+  const bottomRing = ring(LENS.y0), topRing = ring(LENS.y1);
+  bottomRing.forEach((_, i) => {
+    const j = (i + 1) % 16, a = (i + 0.5) / 16 * 2 * Math.PI;
+    face([Math.cos(a), 0, Math.sin(a)], [bottomRing[i], bottomRing[j], topRing[j], topRing[i]], [70, 70, 75], false, 1);
+  });
+  face([0, 1, 0], topRing, [90, 170, 230], true, 1);
+  const bottom = place([0, 1, 0]), top = place(PIVOT);
+  const line = (a, b) => { g.strokeStyle = '#fff'; g.lineWidth = 2; g.beginPath(); g.moveTo(...a); g.lineTo(...b); g.stroke(); };
+  shapes.push([(bottom[2] + top[2]) / 2, () => line(project(bottom), project(top))]);
+
+  const [px, py] = project(top);
+  // The balloon line above the tie-off point
+  line([px, 0], [px, py]);
+  shapes.sort((a, b) => a[0] - b[0]).forEach(([, draw]) => draw());
+  g.fillStyle = '#fff'; g.beginPath(); g.arc(px, py, 4, 0, 2 * Math.PI); g.fill();
+  if (!att) { g.fillStyle = '#777'; g.font = '12px sans-serif'; g.fillText(r ? 'No IMU data' : 'Waiting for telemetry…', 8, c.clientHeight - 8); }
+}
+drawModel(null);
+
+function addPhoto(ph) {
+  photos.push(ph);
+  const g = document.getElementById('gallery');
+  if (g.textContent === 'No photos yet') g.textContent = '';
+  const a = document.createElement('a');
+  a.href = 'photos/' + ph.name; a.target = '_blank';
+  const where = ph.alt === null ? '' : ` · ${ph.alt.toFixed(0)} m`;
+  a.innerHTML = `<img loading="lazy" src="photos/${ph.name}" alt=""><span>${new Date(ph.time * 1000).toLocaleTimeString()}${where}${ph.partial ? ` · ${ph.complete ?? 'partial'}%` : ''}</span>`;
+  g.prepend(a);
+}
+
+async function poll() {
+  try {
+    const s = await (await fetch(`api/state?t=${t}&p=${p}`)).json();
+    // A new flight was started (KEY2 on the receiver): start over with only its data
+    if (flight !== null && s.flight !== flight) { location.reload(); return; }
+    flight = s.flight;
+    rows.push(...s.telemetry); t = s.t;
+    s.photos.forEach(addPhoto); p = s.p;
+    showPhotoRate();
+    if (s.telemetry.length) {
+      showTelemetry(rows.at(-1));
+      drawModel(rows.at(-1));
+      const fixes = rows.filter(r => r.fix === '1' && r.lat !== null).map(r => [r.lat, r.lon]);
+      track.setLatLngs(fixes);
+      if (fixes.length) {
+        here.setLatLng(fixes.at(-1)).addTo(map);
+        if (document.getElementById('follow').checked) map.panTo(fixes.at(-1));
+      }
+      const gps = rows.filter(r => r.fix === '1' && r.alt !== null).map(r => [r.time, r.alt]);
+      graph('alt', [{ name: 'GPS', color: '#4682dc', points: gps },
+                    { name: 'Baro', color: '#e6781e', points: points('baro_alt') }]);
+      graph('temp', [{ name: 'Temp', color: '#dc5050', points: points('temp') }]);
+      graph('rate', [{ name: 'Baro', color: '#e6781e', points: ascentRate() }]);
+      graph('signal', [{ name: 'LoRa', color: '#4682dc', points: points('rssi') },
+                       { name: 'FLRC', color: '#e6781e', points: points('flrc_rssi') },
+                       { name: 'LoRa SNR', color: '#50c878', points: points('snr') }], SIGNAL_ZONES);
+      graph('quality', [{ name: 'LoRa packets', color: '#4682dc', points: loraReceived() },
+                        { name: 'Image data', color: '#e6781e', points: imageReceived() }]);
+      // Before a fix the satellite sends satellites heard, after it satellites used
+      const sats = fix => rows.filter(r => r.fix === fix).map(r => [r.time, Number(r.sats)]);
+      graph('gps', [{ name: 'Sats heard', color: '#e6781e', points: sats('0') },
+                    { name: 'Sats used', color: '#50c878', points: sats('1') }]);
+    }
+    if (s.image.version !== imageVersion && s.image.version > 0) {
+      imageVersion = s.image.version;
+      document.getElementById('live').src = 'api/image.jpg?v=' + imageVersion;
+    }
+    document.getElementById('istatus').textContent = s.image.status;
+    showProgress(s.image.status);
+    document.getElementById('log').textContent = s.log.join('\n');
+    document.getElementById('conn').textContent = 'live · ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('conn').textContent = 'connection lost, retrying…';
+  }
+  setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body>
+</html>

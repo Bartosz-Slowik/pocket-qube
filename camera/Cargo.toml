@@ -1,0 +1,34 @@
+[package]
+name = "camera"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+
+[[bin]]
+name = "camera"
+harness = false
+
+[profile.release]
+opt-level = 3
+
+# Only our crate: changing dependency settings would rebuild all of ESP-IDF
+[profile.release.package.camera]
+incremental = true
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = "0.53"
+jpeg-encoder = "0.7"
+
+[build-dependencies]
+embuild = "0.33"
+
+# The same C camera driver as Arduino's CameraWebServer, bound to Rust as `esp_idf_svc::sys::camera`
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp32-camera", version = "2" }
+bindings_header = "src/bindings.h"
+bindings_module = "camera"
